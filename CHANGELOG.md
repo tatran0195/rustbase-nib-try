@@ -1,0 +1,696 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+versioning follows [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+(nothing yet)
+
+## [0.2.2] — 2026-09-08
+
+(nothing yet)
+
+## [0.2.1] — 2026-09-07
+
+### Fixed
+
+- **The Docker image builds again — it had not since the OpenAPI spec
+  was embedded.** `rustbase-server` pulls `docs/reference/openapi.yaml`
+  in with `include_str!`, but the build context excluded it twice
+  over: the `Dockerfile` never copied `docs/`, and `.dockerignore`
+  dropped it from the context anyway. Neither shows up in a local
+  `cargo build`, where the whole repository is present, so the failure
+  only ever appeared inside `docker build` — and `v0.2.0` shipped with
+  no image at all.
+
+- **The published image starts as its own unprivileged user.**
+  `VOLUME /home/rustbase/data` was materialised by Docker as root
+  while the process runs as uid 10001, so the server exited on
+  `unable to open database file` the first time anyone ran the image
+  plainly. The directory is now created and owned before the volume is
+  declared. Verified by running the built image with no flags:
+  `/healthz`, `/openapi.yaml` and the dashboard all answer 200.
+
+- **The release SBOM is actually produced, and its absence is now an
+  error.** The step copied `rustbaas.cdx.json` — the workspace's name
+  before the rename to `rustbase` — and fell back to `ls *.cdx.json`,
+  which matches nothing because `cargo cyclonedx --all` writes one
+  document next to each crate's `Cargo.toml` and none at the root. The
+  step therefore *succeeded* having written no file, and the release
+  went out without an SBOM. It now takes `rustbase-server`'s document,
+  the dependency graph of the binary the release actually ships, and
+  fails loudly when none was written.
+
+- **The JS SDK test suite no longer depends on the Node version.** Its
+  `FakeWebSocket` built a real `CloseEvent`, a global that only exists
+  from Node 23 on. The suite passed on a developer machine running
+  Node 24 and failed on the CI runner. The listener under test reads
+  `code` and `reason` and nothing else, so a plain object carries what
+  the contract needs.
+
+### Changed
+
+- **Dependencies are compiled optimised under `cargo test`.** Argon2 is
+  deliberately slow, and an unoptimised build made it slower still, so
+  every login test paid a full unoptimised hash — most of the suite's
+  wall clock. Measured on `rustbase-api`: **294s → 16s**. Workspace
+  crates stay unoptimised, so debug info and compile times for the code
+  under test are unchanged; the first build after this change is longer
+  while the dependencies are rebuilt.
+
+## [0.2.0] — 2026-09-04
+
+### Changed — BREAKING
+
+- **Bearer secrets are stored as SHA-256 digests, not in clear.**
+  A read of a `.db` file used to hand over every live session, every
+  pending password-reset and email-verification link, every in-flight
+  OTP code and OAuth state nonce. Seven columns now hold digests:
+  `_refresh_tokens.token → token_hash` (system + workspace scopes),
+  `_password_resets.token`, `_email_verifications.token`,
+  `_mfa_challenges.token` → `token_hash`, `_email_otps.code →
+  code_hash`, `_oauth_states.state → state_hash`. Hashing happens
+  inside `rustbase-db`, so callers keep passing clear values and no
+  call site can forget it. A bare SHA-256 is deliberate: the inputs
+  are 256-bit `OsRng` draws, so there is no guessable space a slow
+  KDF would stretch, and lookup stays O(1) on the digest.
+
+  **Operator impact, on first boot after upgrade:**
+  - **Every session is signed out once.** Migration
+    `20260904_000001_hash_refresh_tokens` drops the existing rows —
+    SQLite has no SHA-256, so stored clear tokens cannot be converted
+    in place. Users log in again; nothing else is lost.
+  - **Password-reset and email-verification links already sent stop
+    working**, as do OTP codes and OAuth flows mid-redirect
+    (`20260904_000002_hash_one_shot_secrets`). They have to be
+    requested again. All of these expire in minutes to hours anyway,
+    so pick a quiet window and the blast radius is small.
+
+  `_oauth_states.code_verifier` is the one secret deliberately left
+  in clear: PKCE requires sending it back to the provider, so it
+  needs reversible encryption rather than a digest. Still pending —
+  its lifetime is the few minutes between `/authorize` and
+  `/callback`. `_user_totp.secret_b32` had the same shape and is
+  handled below.
+
+- **`RUSTBASE_KEK` moves the key-encryption key out of the data
+  directory.** The key that encrypts at-rest secrets used to be
+  generated on first boot and filed in `system.db._secrets`, i.e. the
+  same file as the ciphertext it protects: anyone able to read the
+  data directory held both halves. The key is now read from
+  `RUSTBASE_KEK` (32 hex bytes — `openssl rand -hex 32`).
+
+  **Operator impact:**
+  - **Existing installs keep working.** With the variable unset, the
+    stored key is still used and every boot logs a warning saying why
+    that is not enough. Set `RUSTBASE_KEK` to the current key to
+    silence it, or rotate.
+  - **A fresh install still boots without the variable** — most
+    deployments never configure OAuth. What is refused is *storing* a
+    secret: `PUT .../oauth/providers/{provider}` with a
+    `client_secret` returns `503` naming the variable, rather than
+    encrypting under a key filed beside the ciphertext.
+  - A secret written under a key that is later missing is an error,
+    never a silent fall back to clear.
+
+- **TOTP secrets are encrypted at rest when a key is configured.**
+  `_user_totp` is rebuilt with `secret_b32` (clear) and `secret_enc`
+  (AES-GCM under the KEK) plus a `CHECK` making "exactly one of the
+  two" a property of the schema rather than a convention. Existing
+  rows migrate as clear.
+
+  Enrolment is deliberately **not** refused when no key is
+  configured: 2FA that exists beats 2FA that is unavailable, and
+  whoever can read the file already holds the password hashes.
+  Without a key the secret is stored in clear and the row says so.
+  Reading a row marked encrypted while the key is missing is an
+  error.
+
+  Unlike the tokens above this cannot be a digest — validating a code
+  needs the secret back.
+
+### Fixed — SECURITY
+
+- **`$app.fetch` bodies are capped at 8 MiB.** The response was
+  accumulated on the Rust side before any of it reached JS, so the
+  hook's 64 MiB QuickJS heap bounded nothing: an authorised host
+  answering with gigabytes took the process down with it. The read
+  now streams and stops at the ceiling. `Content-Length` is ignored
+  on purpose — it is upstream-supplied and can lie or be absent.
+
+- **`$app.fetch` fails shut when its HTTP client cannot be built.**
+  The previous fallback quietly substituted a default `reqwest`
+  client — one that follows redirects and carries no timeout — so a
+  construction failure silently undid both guarantees the configured
+  client exists to provide.
+
+- **File downloads are always attachments.** Uploads were served back
+  with the MIME type the uploader declared, from the API's own origin
+  — the one carrying the `rb_at` cookie. An uploaded `text/html` file
+  therefore ran as first-party script; `nosniff` is no defence, since
+  the type is asserted rather than guessed. Every download now
+  carries `Content-Disposition: attachment`, with the filename quoted
+  and stripped of anything that could inject header parameters. The
+  `Content-Type` is unchanged.
+
+- **The rate limiter can key on the forwarded client address.** It
+  keyed on the peer address only, so behind the reverse proxy the
+  deployment guide recommends, every request looked like it came from
+  the proxy: the entire traffic shared one bucket, one client could
+  exhaust it for everyone, and per-client brute-force limiting did
+  not exist. New `trust_proxy_headers` under `[rate_limit]`,
+  **off by default** — trusting `X-Forwarded-For` on a directly
+  exposed server would let any caller mint a fresh identity per
+  request and escape the limiter entirely.
+
+- **`$app.fetch` no longer follows redirects out of its allowlist.**
+  The workspace host allowlist was enforced once, before the request
+  left. An authorised host answering `302` carried the hook wherever
+  the `Location` header pointed — internal services and cloud
+  metadata endpoints included — because `reqwest` follows redirects
+  by default and never re-consults the allowlist. The client is now
+  built with `redirect::Policy::none()`; the redirect is handed back
+  to the JS caller, which can re-issue it through `$app.fetch` and
+  have it checked properly. Regression-locked by a test that stands
+  up two loopback servers, one on the allowlist redirecting to one
+  that is not.
+
+### Added
+- **Observability — third wave: hooks, files, mailer.** Completes
+  the domain-level metric surface promised by phase 10.
+  - `rustbase_hook_dispatches_total{event, outcome}` — counter
+    on the hook engine's `dispatch` path. `event` covers the
+    full `HookEvent` enum (`after_create`, `before_update`,
+    `user_after_login`, etc.); `outcome` is `success` | `error`
+    (CPU/memory bail or bridge-side serialisation failure).
+    Per-handler JS exceptions stay in `__rb_record_error` and
+    do NOT bump the counter.
+  - `rustbase_hook_dispatch_duration_seconds{event}` — histogram
+    sharing the duration buckets configured for the HTTP layer;
+    measures the entire dispatch including payload + request
+    serialisation.
+  - `rustbase_file_uploads_total` + `rustbase_file_upload_bytes_total`
+    — two no-label counters on `files::upload`. Operators get
+    throughput in MB/s by differencing the bytes counter against
+    `rustbase_http_request_duration_seconds{route=".../files"}`.
+  - `rustbase_mailer_dispatches_total{kind, outcome}` — counter
+    at every `state.mailer.send(...)` call site (verify_email,
+    otp_login, password_reset). Hook-driven sends via
+    `$app.mailer.send` flow through `QuotedMailer` and are NOT
+    counted here — they show up in the parent hook-dispatch
+    counter via the calling JS handler.
+  - `metrics` workspace dep landed on `rustbase-runtime`
+    (`rustbase-api` already had it from phase 10.1).
+  - End-to-end smoke against a fresh binary verified the file
+    counters (`rustbase_file_uploads_total 1`,
+    `rustbase_file_upload_bytes_total 11`) after one upload.
+  - Docs (`guide/observability.md`) gains a section per family.
+    "What's not (yet) exported" closes out: every promised
+    family is now live; per-tenant breakdowns remain off by
+    design (cardinality).
+- **Realtime wrapper in `@rustbase/client` + WebSocket `?token=`
+  fallback on the server.**
+  - **Server**: `record_events_ws` now resolves the access token in
+    the order `Authorization` header → `rb_at` cookie → `?token=`
+    query. The query fallback exists for browser clients — the
+    `WebSocket` constructor can't set request headers. A new
+    `principal_from_token` helper in `crates/rustbase-api/src/auth/extract.rs`
+    decodes a raw token into `PrincipalAuth`, bypassing the axum
+    extractor chain. SSE behaviour unchanged.
+  - **SDK**: new `Subscription` class returned by
+    `rb.app(id).collection(slug).subscribe({ filter? })`. Owns one
+    `WebSocket` plus a reconnect loop with jittered exponential
+    backoff (500 ms → 30 s cap, ±500 ms jitter). On policy-violation
+    closes (1008 / 4001 / 4003) it calls `auth.refresh()` BEFORE
+    the next connect so a rotated refresh token doesn't break the
+    stream silently. Listeners:
+    `open / close / error / record_created / record_updated /
+    record_deleted`. `close()` is idempotent and stops the
+    reconnect loop. `auth.refresh()` is now a public method —
+    thin wrapper around the existing one-shot refresh used by the
+    HTTP layer.
+  - Pure dispatcher (`dispatchRealtimeEvent`) is exported for
+    tests so the event routing contract is unit-locked without a
+    real socket.
+  - Tests: 9 new specs (URL building http→ws + https→wss + token
+    + filter; lifecycle open / message / close; reconnect
+    scheduling on abnormal close; explicit-close stops reconnect;
+    unknown event kinds silently ignored for forward-compat).
+    SDK suite total: 18 / 18 green.
+  - Docs: `guide/sdk-js.md` grows a Realtime section, cookbook
+    `realtime.md` adds an SDK-shortcut block, OpenAPI gains a
+    `subscribeRecordsWs` operation under Records with the
+    `filter` + `token` query parameters and the 101/401
+    responses.
+- **Domain-level Prometheus metrics.** Second wave of
+  observability counters + gauges on top of the HTTP layer from
+  10.1. Five new metric families, all bounded cardinality:
+  - `rustbase_auth_logins_total{kind,outcome}` — every login
+    funnels through the existing audit-event helper, so master
+    + workspace + user logins are covered in one site. Outcomes:
+    `success`, `failed`, `locked`.
+  - `rustbase_auth_refresh_total{kind,outcome}` — wraps each of
+    the three refresh handlers (master / user / workspace_admin).
+    Failures collapse all 401 reasons (no token, unknown token,
+    rotation race) into one `failed` outcome — from an
+    operator's perspective they're indistinguishable.
+  - `rustbase_db_pools_open{scope}` — gauge re-`.set()` after
+    every `WorkspacePoolManager` / `AppPoolManager` mutation
+    (put, evict, cascade-evict). `scope` ∈ `workspace` | `app`.
+    Sitting at the configured cap means the LRU is evicting on
+    every new tenant access.
+  - `rustbase_realtime_channels_open` — gauge re-`.set()` after
+    every broker channel insert / drop. One series, no labels
+    (a per-collection breakdown would explode cardinality).
+  - `rustbase_realtime_events_published_total{outcome}` —
+    counter on every `publish()`. `outcome` ∈ `delivered`
+    (at least one subscriber received it) | `no_subscribers`
+    (event dropped).
+  All emissions are no-ops when the global recorder isn't
+  installed (i.e. when `[observability]` is off), so the change
+  is zero-cost in default deployments. Docs updated with the
+  full per-family explainer and operator-facing reading guide.
+- **JavaScript / TypeScript SDK (`@rustbase/client`).** New
+  `sdks/js/` package implementing an idiomatic, fully-typed
+  client around the OpenAPI-documented surface. Owns a single
+  in-memory `Session = { accessToken, refreshToken, user }` with
+  an `onSessionChange` hook for caller-controlled persistence; a
+  401 on any authenticated call triggers ONE transparent refresh
+  + replay before surfacing the original error. Fluent API:
+  `rb.auth.{ register, login, completeMfa, requestVerification,
+  confirmVerification, logout }`, `rb.app(id).collection(slug)
+  .{ list, get, create, update, delete }`, and
+  `rb.app(id).files.{ upload, serveUrl }`. Every non-2xx
+  response throws a typed `RustBaseError(status, code, message,
+  body?)`; transport-layer failures get `code: 'network'`,
+  `status: 0`. Vitest covers URL building, login both branches
+  (tokens + MFA), the 401-refresh-replay loop, error mapping,
+  logout-clears-session-even-on-server-failure, and the
+  multipart upload contract — 9 tests, all green. New CI job
+  `sdk-js (build + test)` runs `bun run build` (tsc → dist) and
+  `bun run test` on every push.
+- **OpenAPI 3.1 spec for the SDK-facing API.** New
+  `docs/reference/openapi.yaml` covers health, end-user auth
+  (`userRegister`, `userLogin`, `userLoginTotp`, `userRefresh`,
+  `userLogout`, `verificationRequest`, `verificationConfirm`),
+  records CRUD (`listRecords`, `createRecord`, `getRecord`,
+  `updateRecord`, `deleteRecord`), and files (`uploadFile`,
+  `serveFile`). 13 paths, 14 schemas, bearer-JWT security scheme.
+  The binary embeds the YAML via `include_str!` and serves it at
+  `GET /openapi.yaml` (public — no secrets in the document) so
+  client codegen has a single source of truth. New docs page
+  `reference/openapi.md` explains scope, authoring, and codegen.
+  Admin / dashboard routes intentionally NOT in this slice yet;
+  they will move in as utoipa annotations land across
+  `rustbase-api`. Until then this file is the canonical SDK
+  input.
+- **Cookbook section in the docs.** Six recipe pages that solve
+  concrete app-builder problems on top of the existing guide:
+  end-to-end sign-up + verification + login + refresh + revoke
+  (with the HttpOnly-cookie pattern for browser clients);
+  `?filter=` + `?sort=` + pagination grammar with the gotchas that
+  fall out of running the same AST in SQL / hooks / dashboard;
+  multipart file upload + `file` field + serve URL + S3 cutover;
+  realtime WebSocket with server-side filter (and SSE alternative);
+  custom HTTP route from a JS hook with the `$app` surface +
+  sandbox limits explained; OAuth login with Google as the
+  worked example (dashboard preset + PKCE flow + variations for
+  GitHub / OIDC). Nav gets a top-level **Cookbook** entry; sidebar
+  groups the recipes under their domains. Build clean.
+- **Prometheus `/metrics` endpoint.** New `[observability]` config
+  section toggles a global `metrics_exporter_prometheus` recorder
+  and mounts `GET /metrics` on the main HTTP listener. Every HTTP
+  request flows through a tower middleware that records
+  `rustbase_http_requests_total{method,route,status}` and
+  `rustbase_http_request_duration_seconds{method,route,status}` —
+  the `route` label uses axum's `MatchedPath` template so
+  cardinality stays bounded regardless of how many workspaces/apps
+  are running. Histogram buckets cover `1ms → 10s`. A
+  `rustbase_build_info{version}` gauge ships the running version.
+  Endpoint is bearer-token gated (`metrics_token`); requests
+  without the right token get **404**, not 401 — scrapers without
+  the token never learn the endpoint exists. Boot aborts when
+  `metrics_enabled = true` is set without a non-empty
+  `metrics_token`. New docs page `guide/observability.md` covers
+  the scrape config, label conventions, and tracing fields.
+- **Dashboard schema editor: draft mode + live diff.** The
+  collection page no longer writes to the server on every Add / Drop
+  click. Edits accumulate in a draft `Field[]` separate from the
+  server's canonical schema. Required and Unique flags are now
+  in-line checkboxes on every row; new fields land via a "Stage
+  field" form. A live diff banner above the table calls out how
+  many fields are **added** (green dot), **modified** (amber),
+  or **dropped** (red), and the table colour-codes each row to
+  match — dropped rows render with a strikethrough name and a
+  Restore action. **Apply** sends one PATCH (with
+  `force=true` whenever the diff contains a drop) and resets the
+  draft to the server's response. **Discard** rolls the draft back
+  to the saved schema.
+- **Dashboard records list: optimistic updates + bulk delete.**
+  Single-row delete now drops the row from the table immediately and
+  rolls back the snapshot if the DELETE comes back as an error.
+  Inline edits paint into the table the moment the modal submits and
+  revert if the PATCH fails, with the error surfacing inside the
+  still-open modal. A new checkbox column lets the user fan-select
+  rows; the header checkbox carries the standard tri-state
+  (none / some / all on-page). When at least one row is selected a
+  bulk-actions toolbar floats above the table with **Delete N** and
+  **Clear**. The bulk delete dispatches one DELETE per row via
+  `Promise.allSettled`, optimistically clears the visible rows, and
+  on partial failure re-syncs from the server while keeping the
+  failing IDs in the selection set. Pagination, filter changes, and
+  collection navigation all clear the selection — rows that aren't
+  visible can't communicate state.
+- **Dashboard dark mode + a11y baseline.** Theme rune
+  (`$lib/theme.svelte`) persists a 3-state choice — Auto / Light /
+  Dark — in `localStorage`. `Auto` follows the OS-level
+  `prefers-color-scheme` and re-evaluates when the OS preference
+  changes. A new `ThemeToggle` button in the global header cycles
+  through the three states. Tailwind's `dark:` variant is
+  reconfigured for class-based dark mode and the component classes
+  in `routes/layout.css` (`.btn-primary`, `.btn-secondary`,
+  `.input`, `.card`, `.error-banner`, etc.) ship matching dark
+  palettes.
+  A11y baseline lands alongside: a keyboard-only "Skip to main
+  content" link, a stylesheet-level focus-visible ring on every
+  focusable element, ARIA labels on the global landmarks, and a
+  `<main id="main-content" tabindex="-1">` target. Two new
+  Playwright specs cover the theme persistence + skip-link round
+  trip.
+- New `Skeleton.svelte` component replaces the 12 hand-rolled
+  `<p>Loading…</p>` placeholders across the dashboard with
+  animated, dark-mode-aware skeleton rows. Tagged `role="status"
+  aria-busy="true"` so screen readers announce the loading state.
+- **Realtime gets server-side filters + a WebSocket transport.**
+  - `FilterNode::matches(fields)` evaluates the same AST the SQL
+    translator consumes against an in-memory record, with parity
+    semantics for `Eq` / `Ne` / `Gt` / `Gte` / `Lt` / `Lte` /
+    `Like` / `In` / `And` / `Or` / `Not`.
+  - The SSE endpoint (`GET …/collections/:coll/events`) now accepts
+    an optional `?filter=<expression>` and only forwards events
+    whose record matches; `record_deleted` events always pass so
+    subscribers can evict cached rows. For collections with a
+    template access rule (e.g. `owner = @request.auth.id`), the
+    rule is materialised against the subscribing principal and
+    **intersected** with the client filter. Template-rule
+    collections, which previously denied realtime outright, are
+    now supported.
+  - New WebSocket endpoint
+    (`GET …/collections/:coll/events/ws`) — same auth, same
+    `?filter=`, same JSON event payloads as SSE. Push-only; client
+    frames are drained but never interpreted.
+- **JS hook runtime** gains two new bridges on the `$app` global:
+  - `$app.fetch(url, init?)` — synchronous outbound HTTP from a hook.
+    Backed by a shared `reqwest::Client` with a 30 s timeout; the
+    request is rejected with `Forbidden` before any network IO when
+    the URL's host isn't on the workspace fetch allowlist
+    (`[hooks.fetch].allowed_hosts` in `rustbase.toml`). Returns an
+    object with `status`, `headers`, `text()`, and `json()`.
+  - `$app.audit.write({action, target?, details?})` — append one row
+    to the per-app audit log straight from a hook. Stored with
+    `actor = "hook"` so the dashboard distinguishes operator events
+    from user-initiated ones.
+- `rustbase_runtime::AppHooksConfig` + `HookEngine::load_app_with` —
+  full bridge bundle on one call. Existing `load_app` / `with_records*`
+  signatures stay as-is for tests; production code (`apps.rs`,
+  `hooks.rs`, `main.rs::load_all_hooks`) uses the new path.
+- New concept page [`docs/concepts/write-amplification.md`](docs/concepts/write-amplification.md)
+  — documents the per-pool fsync ceiling, the post-batching commit
+  count for every hot auth path, and the explicit future-work list
+  for audit + multi-step flows.
+- **Supply-chain hardening.** Every release artefact now ships with
+  provenance and a vulnerability paper trail:
+  - Each tarball, the container image, and a workspace **CycloneDX
+    1.5 SBOM** are signed keylessly with **Sigstore Cosign** (GitHub
+    OIDC → Fulcio short-lived certs). `.sig` + `.pem` sidecars ride
+    along with every artefact. Verification recipe in
+    [`SECURITY.md`](SECURITY.md#verifying-release-artefacts).
+  - **Trivy** scans the workspace filesystem on every PR
+    (Rust + Bun lockfile transitives, Dockerfile mis-configs,
+    secret leaks) and the released container image post-publish.
+    Findings surface on the GitHub Security tab — `exit-code: 0`
+    so a new transitive CVE doesn't block PRs / releases.
+  - **CodeQL** static analysis of the dashboard
+    (JavaScript / TypeScript / Svelte) on push to `main`, every PR,
+    and weekly.
+- **Playwright end-to-end smoke suite** in `ui/tests/e2e/` driven by
+  `scripts/e2e-server.sh` (boots a release `rustbase` against a
+  throw-away `data/` dir + the freshly-built dashboard, then runs the
+  suite headless). One spec walks setup → login → workspace → app →
+  collection. Run with `make e2e` after a one-off `make e2e-install`.
+- **Brand: project renamed to RustBase.** New tagline: _"Multi-tenant
+  backend. Single binary. Real isolation."_ The on-disk layout, crate
+  names, and config keys are unchanged; only public-facing wording
+  moved.
+- New positioning page (`docs/concepts/positioning.md`) — explicit
+  "who this is for" / "who it is not for" / "what multi-tenant means
+  here precisely" / "when to outgrow RustBase."
+- New comparison page (`docs/guide/comparison.md`) — RustBase vs
+  PocketBase / Supabase / Appwrite, feature-by-feature plus a
+  decision matrix.
+- Deployment guide rewritten end to end: Hetzner sizing, hardened
+  systemd unit, Caddy + Let's Encrypt with security headers, Nginx
+  alternative, tarball-backup timer, Litestream sidecar, upgrade flow,
+  hardening checklist.
+- **Security layer 1 — defaults on:**
+  - Per-IP token-bucket rate limit at the entry layer (50 r/s, 100
+    burst by default) via `tower_governor`. Rejected with `429
+    too_many_requests` + `Retry-After`. Tunable under `[rate_limit]`.
+  - Per-subject auth lockout shared across password / TOTP /
+    email-OTP. 5 failures inside 5 min → 5 min lockout, returned as
+    `429` + `Retry-After`. Tunable under `[lockout]`.
+  - Conservative default-on security headers (HSTS, X-Content-Type-
+    Options, Referrer-Policy, X-Frame-Options, baseline CSP,
+    Permissions-Policy). Tunable / disable under `[http]`.
+  - CORS allowlist; empty default = same-origin only. Tunable under
+    `[cors]`.
+  - HTTP request body cap (`[http].max_body_bytes`, default 8 MiB).
+  - Audit rows: `login_success` / `login_failed` / `login_locked` for
+    every auth flow.
+- New error variant `CoreError::TooManyRequests { retry_after_secs }`
+  → HTTP 429 with `Retry-After` header. Reference docs updated.
+- **JWT signing now uses RS256 by default** with a deterministic `kid`
+  derived from the SHA-256 of the public key. RSA-2048 keypair is
+  generated once at first boot and persisted as PKCS#8 DER under
+  `system.db._secrets`.
+- **JWKS endpoint** at `/.well-known/jwks.json` and
+  `/_/auth/jwks.json`. Returns `Content-Type:
+  application/jwk-set+json`, `Cache-Control: public, max-age=3600`,
+  and stays reachable pre-setup so external smoke probes can discover
+  the key. Standard JWT libraries (jose, jsonwebtoken,
+  oidc-client-ts) consume it without custom config.
+- `rustbase-auth::JwtIssuer` is the new issuance/verification surface
+  (`issue`, `verify`, `jwks`). HS256 tokens issued before the upgrade
+  continue to verify until they expire on their own; the legacy HMAC
+  key is kept as a verification-only fallback.
+
+### Changed
+- **Write amplification on the auth happy paths cut roughly in half.**
+  Two new combinators in `rustbase_db::tokens` —
+  `commit_user_login` (bumps `users.last_login` + inserts the
+  refresh-token row in one transaction) and `rotate_refresh_token`
+  (revokes the old + inserts the new in one transaction) — collapse
+  the per-fsync cost of every successful login (password / OAuth /
+  TOTP / email-OTP) and every refresh-rotation to a single commit
+  each, down from two. The handler-side migrations are mechanical
+  drop-in replacements; no semantic change to the API.
+
+### Fixed
+- **Dashboard CSP**: the strict `script-src 'self'` header we shipped
+  in the security-layer-1 rollout was blocking SvelteKit's own
+  SHA-hashed inline boot script, leaving the dashboard a blank page
+  whenever `http.security_headers = true` (the default). The fix
+  moves the dashboard's CSP onto a `<meta http-equiv>` tag emitted
+  by SvelteKit (`kit.csp.mode = 'hash'`), which auto-hashes every
+  inline script per build, and drops the server-side CSP header
+  entirely (JSON API responses don't need CSP).
+
+### Changed — BREAKING
+
+- **Concept renamed: `Realm` → `Workspace`.** Every public surface
+  follows: REST routes (`/api/realms/...` → `/api/workspaces/...`),
+  dashboard URLs (`/_/realms/...` → `/_/workspaces/...`), on-disk
+  layout (`data/realms/<id>/realm.db` → `data/workspaces/<id>/workspace.db`),
+  DB tables (`realms` → `workspaces`, `realm_admins` →
+  `workspace_admins`), JSON config keys (`realm_pool_cap` →
+  `workspace_pool_cap`), error codes (`realm_not_found` →
+  `workspace_not_found`), JWT claims (`realm` → `workspace`), Rust
+  types (`RealmId`, `RealmAdmin`, `RealmCtx`, `RealmPoolManager` →
+  `Workspace*`), and migration constants (`REALM_MIGRATIONS` →
+  `WORKSPACE_MIGRATIONS`).
+- **End-user identity moves from per-app to per-workspace.** A single
+  `(email, workspace)` pair is one identity across every app in that
+  workspace. Concretely:
+    - User tables (`users`, `oauth_providers`, `user_oauth_links`,
+      `_email_verifications`, `_password_resets`, `_email_otps`,
+      `_user_totp`, `_mfa_challenges`, `_oauth_states`) move from
+      app-scope `data.db` to workspace-scope `workspace.db`.
+    - Every auth route loses its `/apps/:app/` segment. New paths:
+      `POST /api/workspaces/:workspace/auth/users/login`,
+      `…/auth/users/register`, `…/auth/users/refresh`,
+      `…/auth/verify-email/{request,confirm}`,
+      `…/auth/password-reset/{request,confirm}`,
+      `…/auth/otp/{request,login}`,
+      `…/auth/totp/{enroll,confirm,disable}`,
+      `…/auth/users/login/totp`,
+      `…/auth/oauth/{provider}/{authorize,callback}`,
+      `…/auth/oauth/providers/[/{provider}]`.
+    - Admin user management routes likewise drop the `/apps/:app/`
+      segment: `GET/PATCH/DELETE /api/workspaces/:workspace/users[/{id}…]`.
+    - User access tokens lose the `app` claim. The per-app target
+      now comes from the URL path on data routes
+      (`/api/workspaces/:workspace/apps/:app/...`) rather than the
+      token claim.
+    - `PrincipalAuth::require_user_in_app(workspace, app)` →
+      `require_user_in_workspace(workspace)`; `user_app()` removed.
+    - User-lifecycle hooks (`onUserBeforeLogin`,
+      `onUserAfterLogin`, `onUserAfterRegister`) fan out across
+      every app in the workspace until workspace-scoped hook
+      loading lands — any app's hook can veto the login.
+- No automatic data migration: existing 0.1.x installs need to
+  point at a fresh `data/` directory or rename the layout manually
+  before upgrading. The maintainer's own dev DB was bootstrapped from
+  scratch.
+- **PKCE (RFC 7636) on every OAuth flow.** `/authorize` mints a
+  32-byte `code_verifier`, persists it alongside the CSRF state,
+  sends `code_challenge=S256(verifier)` + `code_challenge_method=S256`
+  to the upstream provider; `/callback` replays the verifier on the
+  token exchange. New `_oauth_states.code_verifier` column added via
+  app-scoped migration `20260604_000001_oauth_pkce`.
+- **Dashboard session moved to `HttpOnly` cookies.** Login + refresh
+  responses set `rb_at` (Path `/`) and `rb_rt` (Path `/_/auth`) with
+  `HttpOnly; SameSite=Strict` (and `Secure` when
+  `[http].cookie_secure = true`, the default). The dashboard SPA
+  removes JWT/refresh tokens from `localStorage`; the React-y identity
+  blob it keeps is no longer secret. New `POST /_/auth/logout`
+  endpoint clears both cookies and revokes the refresh token.
+  `AdminAuth` / `PrincipalAuth` accept `rb_at` as a fallback for
+  `Authorization: Bearer …` so SDK clients are unaffected.
+
+### Changed
+- README hero copy and badge row aligned with the new positioning.
+- `rustbase.toml.example` documents every new section.
+- `docs/guide/configuration.md`: full reference now includes `[http]`,
+  `[cors]`, `[rate_limit]`, `[lockout]`.
+
+## [0.1.1] — 2026-06-03
+
+### Added
+- Multi-arch Docker image published to `ghcr.io/pjonaszik/rustbase` on
+  every release tag (linux/amd64 + linux/arm64).
+- Root-level `Dockerfile` for reproducible builds + local `docker build`.
+- `ARCHITECTURE.md` summarising the crate map, hierarchy, and bootstrap
+  for new contributors.
+- `ROADMAP.md` with the public sketch of v0.2 → v1.0.
+- Logo (`docs/public/logo.svg`) and favicons (32px / 192px / SVG) in
+  RustBase orange.
+- Social-preview image (`docs/public/social-preview.png`, 1280×640)
+  wired into the docs `og:image` / Twitter card meta tags.
+- README header now embeds a real dashboard sign-in screenshot.
+- New GitHub label taxonomy: `type:*`, `scope:*`, `status:*`, `needs:*`.
+- Welcome post pinned in GitHub Discussions (Announcements category).
+- Dashboard smoke job in `ci.yml` that asserts asset prefixes, runtime
+  `paths.base`, GET fallback on `/_/setup` / admin login / refresh, deep
+  links, and that POST `/healthz` stays an honest 405.
+
+### Changed
+- README badge row reorganised; live screenshot replaces the previous
+  text-only intro.
+
+### Fixed (#17 — dashboard SPA mount)
+- `rustbase-server/build.rs` now sets `VITE_BASE=/_` when invoking
+  `bun run build`, so the SvelteKit static build embeds the correct
+  `paths.base` at both the asset-path level (`/_/_app/...`) and the
+  runtime config level (`__sveltekit_xxx.base = "/_"`).
+- `crates/rustbase-server/src/main.rs` attaches a
+  `method_not_allowed_fallback` to the merged router: `GET` requests
+  under `/_/` that hit a POST-only API route (e.g. `/_/setup`,
+  `/_/auth/admin/login`, `/_/auth/refresh`) fall through to the dashboard
+  SPA shell so direct navigation + hard refresh work. Other 405s stay
+  honest 405s — the rule is path-prefixed.
+- `crates/rustbase-server/src/dashboard.rs::asset` falls back to
+  `index.html` for paths that look like client-side routes (no extension,
+  no `_app/` prefix), so deep links like `/_/workspaces/acme/apps/web`
+  reload cleanly.
+- `ui/src/lib/nav.ts` introduces a `goto` helper that prefixes
+  SvelteKit's configured `base` to absolute-path hrefs. Every
+  `+page.svelte` and `+layout.svelte` now navigates through this helper,
+  so embedded-mount navigation no longer escapes the `/_/` prefix.
+
+### Build
+- Dependabot bumps: `download-artifact` 4 → 8, `upload-artifact` 4 → 7,
+  `actions/checkout` 4 → 6, `actions/configure-pages` 5 → 6,
+  `actions/deploy-pages` 4 → 5, `actions/upload-pages-artifact` 3 → 5,
+  `softprops/action-gh-release` 2 → 3, `rquickjs` 0.9 → 0.11,
+  `validator` 0.19 → 0.20, `config` 0.14 → 0.15, `prettier-plugin-svelte`
+  3.5 → 4.0, `prettier-plugin-tailwindcss` 0.7 → 0.8.
+
+[Unreleased]: https://github.com/pjonaszik/rustbase/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/pjonaszik/rustbase/compare/v0.1.0...v0.1.1
+
+## [0.1.0] — 2026-05-27
+
+First public release. The shape of the API and on-disk layout is stable enough
+to commit to, but everything is `0.x` — breaking changes are still possible
+between minors until v1.0.
+
+### Added
+- **Three-level tenancy:** `System → Realm → App`. Master admins manage realms;
+  realm admins manage apps in their realm; app admins are scoped to one app.
+- **End-user pool per app.** Users, OAuth provider config, refresh tokens, and
+  every auxiliary auth table (email verifications, password resets, OTPs,
+  TOTP, MFA challenges) live in each app's `data.db`. A user registered in
+  `acme/mobile` is a different identity than the same email in `acme/web`.
+- **Auth flows:** email + password, email OTP (passwordless), TOTP second
+  factor, OAuth2 / OIDC (Google, GitHub, Microsoft presets shipped). All
+  flows under `/api/realms/:realm/apps/:app/auth/...`.
+- **Auto-seeded master admin.** First boot inserts an `admin` master-admin
+  row with a NULL password; the setup wizard (`POST /_/setup` with
+  `{password}`) finalizes initialization. Login is `{username, password}`.
+- **JWT tokens with explicit scope claims.** Master admin tokens carry no
+  scope. Realm-admin tokens carry `realm`. App-admin and end-user tokens
+  carry both `realm` and `app`. 15-min default access TTL, 30-day refresh
+  with rotation-on-use.
+- **Collections engine.** `base`, `auth`, and (planned) `view` kinds. Field
+  types: text, number, bool, json, datetime, email, url, file, relation.
+- **Filter parser.** Boolean expressions with `&&`, `||`, `!`, comparison
+  operators, `~` LIKE, `?=` IN, and template placeholders. Compiles to
+  parameterized SQL — every literal is bound.
+- **Access rules per collection action.** `list`, `get`, `create`, `update`,
+  `delete`, each with its own template or filter expression.
+- **Realtime broker.** SSE and (planned) WebSocket subscriptions per
+  collection. Post-mutation hooks publish to the broker.
+- **File storage.** Local disk or any S3-compatible bucket via `object_store`.
+  Metadata in `data.db`, blobs in `storage/`.
+- **JS/TS hooks.** Embedded QuickJS runtime via `rquickjs`. Lifecycle hooks
+  (`onRecord{Before,After}{Create,Update,Delete}`), user-lifecycle hooks
+  (`onUser{BeforeLogin,AfterLogin,AfterRegister}`, app-scoped), custom HTTP
+  routes (`$app.routerAdd`), cron jobs (`$app.cron`), mailer hooks. Sandboxed
+  with hierarchical CPU / memory / network / FS policies.
+- **Hierarchical policy engine.** Master sets bounds; realm tightens; app
+  picks a value inside both. Auto-clamp when a parent narrows, with an audit
+  entry written to every affected scope.
+- **Audit log per scope.** Append-only `audit_log` table in each `*.db`.
+- **Embedded SvelteKit dashboard** at `/_/`. Master-admin setup wizard,
+  realm / app / collection / record CRUD, hooks editor, files browser,
+  per-scope audit and policies, users + OAuth tabs per app.
+- **VitePress documentation** at <https://pjonaszik.github.io/rustbase/>.
+- **CI**: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`,
+  `cargo audit` on every PR. Release build job on every push to `main`.
+
+### Crates published
+- `rustbase-core` — IO-free domain types + filter parser.
+- `rustbase-db` — SQLite layer (system / realm / app pools, migrations).
+- `rustbase-auth` — JWT, argon2, AES-GCM KEK, TOTP, OAuth2.
+- `rustbase-realtime` — in-process pub/sub broker.
+- `rustbase-storage` — local + S3 via `object_store`.
+- `rustbase-runtime` — QuickJS-based hook runtime.
+- `rustbase-api` — axum handlers (REST, SSE).
+- `rustbase-server` — the binary.
+
+[Unreleased]: https://github.com/pjonaszik/rustbase/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/pjonaszik/rustbase/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/pjonaszik/rustbase/releases/tag/v0.1.0

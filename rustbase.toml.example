@@ -1,0 +1,123 @@
+# RustBase server configuration.
+# Copy to rustbase.toml in the working directory.
+# Any value can be overridden by an RUSTBASE_* environment variable.
+
+# HTTP listener address.
+listen = "0.0.0.0:8080"
+
+# Path to the data directory. Created if missing.
+data_dir = "./data"
+
+# LRU caps for per-workspace and per-app SQLite pools.
+workspace_pool_cap = 32
+app_pool_cap = 64
+
+# HTTP hardening at the entry layer. Defaults shown.
+[http]
+# Maximum request body size, in bytes (8 MiB by default).
+max_body_bytes = 8388608
+# Default-on bundle of security headers (HSTS, X-Content-Type-Options,
+# Referrer-Policy, X-Frame-Options, Permissions-Policy). The dashboard
+# self-applies its CSP via SvelteKit's hash-mode meta tag.
+# Disable only when an upstream reverse proxy already injects them.
+security_headers = true
+# HSTS `max-age=` value in seconds. `0` omits the header.
+# 63072000 = 2 years; the OWASP-recommended baseline once TLS is the
+# only way clients reach the server.
+hsts_max_age_secs = 63072000
+hsts_include_subdomains = true
+# Emit the dashboard session cookies (`rb_at`, `rb_rt`) with the
+# `Secure` attribute. Defaults to `true` (production behind TLS). Set
+# to `false` for local-dev HTTP — browsers reject `Secure` cookies
+# on non-TLS origins.
+cookie_secure = true
+
+# CORS allowlist for the REST API. Default: no cross-origin allowed.
+# The dashboard is same-origin and does not need an entry here.
+[cors]
+allow_origins = []
+allow_credentials = false
+max_age_secs = 600
+
+# Per-IP token-bucket rate limit at the entry layer. Rejected requests
+# come back as 429 with a Retry-After header.
+[rate_limit]
+enabled = true
+per_second = 50
+burst = 100
+# Key the limiter on the client address forwarded by a proxy
+# (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) instead of the address
+# RustBase sees on the socket.
+#
+# Turn this on ONLY when a proxy you control sits in front and
+# overwrites those headers. Exposed directly, it lets any caller mint a
+# fresh identity per request and slip past the limiter entirely.
+#
+# Leave it off behind a proxy and the opposite bites: every request
+# carries the proxy's own address, so all your traffic shares a single
+# bucket — one noisy client throttles everyone, and per-client
+# brute-force limiting stops working.
+trust_proxy_headers = false
+
+# Per-subject auth lockout. After `max_failures` rejected credential
+# attempts inside `window_secs`, the subject (master admin / realm
+# admin / end user) is locked out for `lockout_secs`. Both the lockout
+# 429 response and the locked-state 429 carry Retry-After.
+[lockout]
+enabled = true
+max_failures = 5
+window_secs = 300
+lockout_secs = 300
+
+# JS hook runtime.
+[hooks.fetch]
+# Host allowlist for `$app.fetch(url, init)` in user hooks. Each entry
+# is a bare hostname; URLs whose host doesn't appear here throw a
+# Forbidden error before any network IO. Empty (the default) means
+# `$app.fetch` is effectively disabled.
+allowed_hosts = []
+# allowed_hosts = ["api.stripe.com", "hooks.slack.com"]
+
+# Optional SQLite → S3 replication via Litestream. Off by default.
+[litestream]
+enabled = false
+# bucket = "s3://my-rustbase-backups"
+# prefix = "prod"
+# replicate_interval_sec = 10
+
+# Optional SMTP relay. Absent → server uses a LogMailer (messages are
+# captured + traced but never delivered) — fine for dev runs that
+# don't need real email yet.
+#
+# For a local dev relay, bring up MailHog:
+#     docker compose -f infra/docker-compose.yml up -d
+# Then uncomment:
+#
+# [mail.smtp]
+# host = "localhost"
+# port = 1025
+# tls  = "none"          # one of: "none" | "start_tls" | "implicit"
+# # username = "..."     # SASL creds optional; MailHog accepts anonymous
+# # password = "..."
+
+# Optional S3-compatible file storage. Absent → uploaded files live
+# under `data_dir/realms/<realm>/apps/<app>/storage/`. Bring up MinIO
+# from infra/docker-compose.yml and uncomment to switch the backend
+# without changing on-disk paths anywhere else:
+#
+# [storage.s3]
+# bucket            = "rustbase-dev"
+# region            = "us-east-1"     # MinIO accepts any value; R2 uses "auto"
+# endpoint          = "http://localhost:9000"   # omit for AWS
+# access_key_id     = "minioadmin"
+# secret_access_key = "minioadmin"
+# # virtual_hosted_style_request = false  # default; required false for MinIO
+
+# Prometheus metrics endpoint. Off by default. When enabled,
+# `GET /metrics` returns the Prometheus text-format snapshot under
+# `Authorization: Bearer <metrics_token>`; any other request gets 404
+# (so misconfigured scrapers can't enumerate the surface).
+#
+# [observability]
+# metrics_enabled = true
+# metrics_token   = "change-me-to-a-long-random-string"

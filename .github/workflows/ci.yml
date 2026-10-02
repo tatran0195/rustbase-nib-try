@@ -1,0 +1,175 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --quiet
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+  trivy-fs:
+    name: trivy filesystem scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Trivy filesystem scan (HIGH + CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          # `vuln` covers `Cargo.lock` + `bun.lock` transitive
+          # advisories; `misconfig` flags Dockerfile / workflow
+          # mistakes; `secret` catches accidentally committed
+          # credentials.
+          scanners: vuln,misconfig,secret
+          # Skip vendored test fixtures and historical artefacts
+          # so the noise stays low.
+          skip-dirs: 'target,ui/.svelte-kit,ui/build,docs/.vitepress/dist'
+          format: sarif
+          output: trivy-fs.sarif
+          # Don't fail CI on every advisory — most are upstream
+          # transitives we can't address in this repo. The SARIF
+          # upload below surfaces them on the Security tab so they
+          # stay visible without blocking PRs.
+          exit-code: '0'
+
+      - name: Upload SARIF to GitHub code-scanning
+        # Same image-and-build cache other Trivy jobs use; switch
+        # category names so Code Scanning groups them separately on
+        # the Security tab.
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  release-build:
+    name: release build
+    runs-on: ubuntu-latest
+    # Only worth running once everything else is green.
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-release
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+  dashboard-smoke:
+    name: dashboard smoke
+    runs-on: ubuntu-latest
+    needs: [release-build]
+    # Regression guard for #17: paths.base, 405 fallback, SPA deep links.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-release
+
+      - name: cargo build --release --bin rustbase
+        run: cargo build --release --bin rustbase
+
+      - name: Boot + smoke
+        run: |
+          mkdir -p /tmp/rb && cd /tmp/rb
+          "${GITHUB_WORKSPACE}/target/release/rustbase" &> /tmp/rb.log &
+          PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:8080/healthz > /dev/null && break
+            sleep 0.5
+          done
+
+          asset=$(curl -s http://localhost:8080/_/login | grep -oE '/_/_app/[a-zA-Z0-9._/-]+\.js' | head -1)
+          test -n "$asset" || { echo "::error::SvelteKit assets not under /_/_app/"; exit 1; }
+          curl -fsS "http://localhost:8080$asset" > /dev/null
+
+          curl -s http://localhost:8080/_/login | grep -q 'base: "/_"' \
+            || { echo "::error::SvelteKit runtime base != /_"; exit 1; }
+
+          for path in /_/setup /_/auth/admin/login /_/auth/refresh /_/realms/acme/apps/web; do
+            status=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080$path")
+            test "$status" = "200" || { echo "::error::GET $path expected 200, got $status"; exit 1; }
+          done
+
+          # `/healthz` POST must STAY 405 — the dashboard fallback is path-prefixed.
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/healthz)
+          test "$status" = "405" || { echo "::error::POST /healthz expected 405, got $status"; exit 1; }
+
+          kill $PID 2>/dev/null || true
+          echo "dashboard smoke OK"
+
+  sdk-js:
+    name: sdk-js (build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install deps
+        working-directory: sdks/js
+        run: bun install --frozen-lockfile
+
+      - name: Type-check + build
+        working-directory: sdks/js
+        run: bun run build
+
+      - name: Tests (vitest, mocked fetch)
+        working-directory: sdks/js
+        run: bun run test
+

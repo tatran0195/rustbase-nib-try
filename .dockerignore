@@ -1,0 +1,23 @@
+target/
+data/
+docs/
+# `rustbase-server` embeds docs/reference/openapi.yaml with
+# `include_str!`, so that one file has to survive the exclusion above
+# or the release build fails at compile time.
+!docs/reference/
+.github/
+.git/
+.gitignore
+.gitattributes
+.githooks/
+ui/node_modules/
+ui/build/
+ui/.svelte-kit/
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+*.md
+!CHANGELOG.md
+!LICENSE-MIT
+!LICENSE-APACHE
+!README.md

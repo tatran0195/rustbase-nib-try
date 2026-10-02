@@ -1,0 +1,166 @@
+//! Email-verification endpoints, workspace-scoped to match the shared
+//! identity pool.
+//!
+//! `POST /api/workspaces/:workspace/auth/verify-email/request` —
+//! authenticated end-user asks to receive a verification email. A
+//! fresh token is issued in the workspace DB, mailed to the user's
+//! stored address, and the response indicates whether a mail was
+//! dispatched. Already-verified users receive `200 OK` with an
+//! `already verified` message instead — we don't leak whether a token
+//! row was created.
+//!
+//! `POST /api/workspaces/:workspace/auth/verify-email/confirm` — anyone
+//! can call. Body carries `{ "token": "<opaque>" }`. The token is
+//! consumed atomically; on success the matching user is marked
+//! verified.
+//!
+//! Tokens are 32 random bytes encoded as 64 hex chars, with a 24-hour
+//! TTL. The `consume` machinery in `rustbase_db::email_verifications`
+//! enforces single-use semantics.
+
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
+use rand_core::{OsRng, RngCore};
+use rustbase_core::{CoreError, EmailMessage, WorkspaceId};
+use rustbase_db::{
+    email_verifications::{self, ConsumeOutcome},
+    users::{find_user_by_id, mark_verified},
+};
+use serde::{Deserialize, Serialize};
+
+use crate::auth::{PrincipalAuth, require_workspace_exists};
+use crate::error::ApiError;
+use crate::state::AppState;
+
+const VERIFICATION_TTL_HOURS: i64 = 24;
+const SYSTEM_FROM_ADDRESS: &str = "no-reply@rustbase.local";
+
+#[derive(Debug, Serialize)]
+pub struct VerifyRequestResponse {
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfirmResponse {
+    pub verified: bool,
+    pub user_id: String,
+}
+
+pub async fn request(
+    auth: PrincipalAuth,
+    State(state): State<AppState>,
+    Path(workspace): Path<String>,
+) -> Result<(StatusCode, Json<VerifyRequestResponse>), ApiError> {
+    // Only end users in this workspace may ask for verification of
+    // their own email; admin tokens and tokens from another workspace
+    // are rejected.
+    auth.require_user_in_workspace(&workspace)?;
+
+    require_workspace_exists(&state, &workspace).await?;
+    let workspace_id = WorkspaceId::from(workspace.clone());
+    let pool = state.workspaces.pool_for(&workspace_id).await?;
+
+    let user = find_user_by_id(&pool, &auth.subject_id)
+        .await?
+        .ok_or(ApiError::Core(CoreError::NotFound {
+            collection: "user".into(),
+            id: auth.subject_id.clone(),
+        }))?;
+
+    if user.verified {
+        return Ok((
+            StatusCode::OK,
+            Json(VerifyRequestResponse {
+                message: "already verified".into(),
+            }),
+        ));
+    }
+
+    let token = fresh_token();
+    email_verifications::issue(
+        &pool,
+        &token,
+        &user.id,
+        chrono::Duration::hours(VERIFICATION_TTL_HOURS),
+    )
+    .await?;
+
+    let body = format!(
+        "Hello,\n\nUse the following token to verify your email address:\n\n\
+         {token}\n\nThis token is valid for {VERIFICATION_TTL_HOURS} hours.\n",
+    );
+    let msg = EmailMessage::new(
+        SYSTEM_FROM_ADDRESS,
+        &user.email,
+        format!("Verify your email for {workspace}"),
+        body,
+    );
+    let send_result = state.mailer.send(msg).await;
+    metrics::counter!(
+        "rustbase_mailer_dispatches_total",
+        "kind"    => "verify_email",
+        "outcome" => if send_result.is_ok() { "success" } else { "failed" },
+    )
+    .increment(1);
+    send_result.map_err(|e| ApiError::Core(CoreError::Internal(format!("mailer: {e}"))))?;
+
+    tracing::info!(
+        workspace = %workspace,
+        user_id = %user.id,
+        "verification token issued + mailed"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(VerifyRequestResponse {
+            message: "verification email sent".into(),
+        }),
+    ))
+}
+
+pub async fn confirm(
+    State(state): State<AppState>,
+    Path(workspace): Path<String>,
+    Json(req): Json<ConfirmRequest>,
+) -> Result<Json<ConfirmResponse>, ApiError> {
+    require_workspace_exists(&state, &workspace).await?;
+    let workspace_id = WorkspaceId::from(workspace.clone());
+    let pool = state.workspaces.pool_for(&workspace_id).await?;
+
+    match email_verifications::consume(&pool, &req.token).await? {
+        ConsumeOutcome::Ok { user_id } => {
+            mark_verified(&pool, &user_id).await?;
+            tracing::info!(workspace = %workspace, user_id = %user_id, "email verified");
+            Ok(Json(ConfirmResponse {
+                verified: true,
+                user_id,
+            }))
+        }
+        ConsumeOutcome::Unknown => Err(ApiError::Core(CoreError::NotFound {
+            collection: "email_verification".into(),
+            id: req.token,
+        })),
+        ConsumeOutcome::AlreadyConsumed => Err(ApiError::Core(CoreError::Conflict(
+            "verification token already used".into(),
+        ))),
+        ConsumeOutcome::Expired => Err(ApiError::Core(CoreError::Conflict(
+            "verification token expired".into(),
+        ))),
+    }
+}
+
+/// 32 random bytes from the OS RNG, hex-encoded (64 chars). No leading
+/// "vrf_" prefix — the column is opaque to clients anyway.
+fn fresh_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}

@@ -1,0 +1,44 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels: [dependencies, rust]
+    groups:
+      patch-updates:
+        update-types: [patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci]
+    groups:
+      # upload-artifact + download-artifact MUST be bumped together —
+      # a major-version skew between them produces a digest-mismatch
+      # at download time. Group them so Dependabot can't ship one
+      # without the other.
+      artifact-actions:
+        patterns:
+          - "actions/upload-artifact"
+          - "actions/download-artifact"
+
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+    labels: [dependencies, ui]
+    groups:
+      patch-updates:
+        update-types: [patch]
+
+  - package-ecosystem: npm
+    directory: "/docs"
+    schedule:
+      interval: weekly
+    labels: [dependencies, docs]
+    groups:
+      patch-updates:
+        update-types: [patch]

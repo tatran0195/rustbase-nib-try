@@ -1,0 +1,465 @@
+use anyhow::Result;
+use axum::{Router, routing::get};
+use rustbase_api::{AppState, build_router};
+use rustbase_auth::{JwtIssuer, RevocationSet, RsaSigningKey, SigningKey, generate_rsa_with_pkcs8};
+use rustbase_db::{
+    AppPoolManager, SYSTEM_MIGRATIONS, SystemPool, WorkspacePoolManager,
+    admins::{ensure_seed_master_admin, master_admin_is_initialized},
+    apply_migrations,
+    docs::bootstrap_site_version_metadata,
+    secrets::{MASTER_RSA_PKCS8, MASTER_SIGNING_KEY, get_or_init_secret, get_secret, put_secret},
+    workspaces::ensure_master_realm,
+};
+use rustbase_realtime::RealtimeBroker;
+use rustbase_runtime::HookEngine;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use tracing_subscriber::EnvFilter;
+
+mod config;
+mod dashboard;
+mod litestream;
+mod observability;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let cfg = config::load()?;
+    tracing::info!(?cfg, "rustbase: starting");
+
+    // Observability: install the global Prometheus recorder if enabled.
+    // Boot aborts on a misconfigured `[observability]` (e.g. enabled
+    // without a token) rather than silently exposing metrics or
+    // running without them.
+    let metrics_handle = observability::init(&cfg.observability)?;
+    if metrics_handle.is_some() {
+        tracing::info!("observability: metrics recorder installed (GET /metrics, bearer-token)");
+    }
+
+    tokio::fs::create_dir_all(&cfg.data_dir).await?;
+
+    let system = SystemPool::open(&cfg.data_dir).await?;
+    let applied = apply_migrations(system.pool().clone(), SYSTEM_MIGRATIONS).await?;
+    if applied > 0 {
+        tracing::info!(applied, "system migrations applied");
+    }
+    ensure_master_realm(system.pool()).await?;
+    // Auto-seed the canonical `admin` master admin row (NULL password)
+    // on first boot. Setup gate keys off the password being set, not
+    // the row existing — so this is safe to call on every boot.
+    ensure_seed_master_admin(system.pool()).await?;
+    let already_initialized = master_admin_is_initialized(system.pool()).await?;
+    if !already_initialized {
+        tracing::warn!(
+            "setup wizard not yet completed — only /healthz and POST /_/setup are reachable; \
+             POST {{\"password\":\"...\"}} to /_/setup to finish bootstrap"
+        );
+    }
+
+    let fresh = SigningKey::generate();
+    let key_bytes = get_or_init_secret(system.pool(), MASTER_SIGNING_KEY, fresh.as_bytes()).await?;
+    let master_key = Arc::new(SigningKey::from_secret(&key_bytes));
+
+    // RS256 keypair. Generated once on first boot, persisted as
+    // PKCS#8 DER, and re-loaded on every subsequent start. The HS256
+    // `master_key` above stays around as a *verification-only*
+    // fallback so already-issued legacy tokens validate until they
+    // expire on their own. New tokens are always RS256.
+    let rsa_key = match get_secret(system.pool(), MASTER_RSA_PKCS8).await? {
+        Some(der) => RsaSigningKey::from_pkcs8_der(&der)?,
+        None => {
+            tracing::info!("jwt: generating master RS256 keypair (first boot)");
+            let (key, pkcs8) = generate_rsa_with_pkcs8()?;
+            put_secret(system.pool(), MASTER_RSA_PKCS8, &pkcs8).await?;
+            key
+        }
+    };
+    tracing::info!(kid = %rsa_key.kid, "jwt: RS256 active key");
+    let jwt =
+        Arc::new(JwtIssuer::new(rsa_key).with_legacy_hmac(SigningKey::from_secret(&key_bytes)));
+
+    // OAuth client_secret encryption key. Generated once at first boot
+    // and persisted; loaded as-is on subsequent boots so existing
+    // ciphertexts in oauth_providers stay decryptable.
+    let stored_kek = rustbase_db::secrets::get_secret(system.pool(), "oauth_kek").await?;
+    let kek =
+        rustbase_auth::resolve_kek(std::env::var("RUSTBASE_KEK").ok().as_deref(), stored_kek)?;
+    if matches!(kek, rustbase_auth::KekSource::FromDatabaseLegacy(_)) {
+        tracing::warn!(
+            "kek: RUSTBASE_KEK is unset, falling back to the key stored in \
+             system.db. That key sits in the same file as the secrets it \
+             encrypts, so anyone who can read the data directory holds both. \
+             Set RUSTBASE_KEK to the current key to silence this, or rotate."
+        );
+    }
+    let oauth_kek = Arc::new(kek.key());
+
+    // Optional: generate litestream.yml at boot when replication is enabled.
+    if cfg.litestream.enabled {
+        match litestream::write_yaml(&cfg.data_dir, &cfg.litestream).await {
+            Ok(path) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "litestream.yml generated — run `litestream replicate -config {}` to start replication",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to generate litestream.yml");
+            }
+        }
+    }
+
+    // Pick a mailer: SMTP if `[mail.smtp]` is configured, otherwise a
+    // capturing LogMailer that only writes to the tracing log. A bad
+    // SMTP config aborts boot — silently downgrading would hide the
+    // misconfiguration until the first verify-email request.
+    let mailer: Arc<dyn rustbase_core::Mailer> = match &cfg.mail.smtp {
+        Some(smtp_cfg) => {
+            let smtp = rustbase_api::mailer::SmtpMailer::new(smtp_cfg)?;
+            tracing::info!(
+                host = %smtp_cfg.host,
+                port = smtp_cfg.port,
+                tls = ?smtp_cfg.tls,
+                "mail: SMTP transport ready"
+            );
+            Arc::new(smtp)
+        }
+        None => {
+            tracing::info!(
+                "mail: no [mail.smtp] configured; using LogMailer \
+                 (messages captured + logged, not delivered)"
+            );
+            Arc::new(rustbase_api::mailer::LogMailer::new())
+        }
+    };
+
+    // File storage backend. S3 if `[storage.s3]` is configured, else
+    // a local directory rooted at `data_dir`. Boot aborts on a bad
+    // S3 config — silent fallback to local would hide misconfig until
+    // the first upload.
+    let storage = match &cfg.storage.s3 {
+        Some(s3_cfg) => {
+            tracing::info!(
+                bucket = %s3_cfg.bucket,
+                region = %s3_cfg.region,
+                endpoint = ?s3_cfg.endpoint,
+                "storage: S3 backend"
+            );
+            rustbase_storage::Storage::s3(s3_cfg)?
+        }
+        None => {
+            tracing::info!(
+                root = %cfg.data_dir.display(),
+                "storage: local backend"
+            );
+            rustbase_storage::Storage::local(&cfg.data_dir).await?
+        }
+    };
+
+    let lockout_policy = rustbase_api::security::LockoutPolicy::from_secs(
+        cfg.lockout.enabled,
+        cfg.lockout.max_failures,
+        cfg.lockout.window_secs,
+        cfg.lockout.lockout_secs,
+    );
+    let state = AppState {
+        system: Arc::new(system),
+        workspaces: Arc::new(WorkspacePoolManager::new(
+            cfg.data_dir.clone(),
+            cfg.workspace_pool_cap,
+        )),
+        apps: Arc::new(AppPoolManager::new(cfg.data_dir.clone(), cfg.app_pool_cap)),
+        revocations: RevocationSet::default(),
+        master_key,
+        jwt,
+        broker: RealtimeBroker::default(),
+        hooks: HookEngine::new(),
+        data_dir: Arc::new(cfg.data_dir.clone()),
+        initialized: Arc::new(AtomicBool::new(already_initialized)),
+        mailer,
+        oauth_kek,
+        storage,
+        login_attempts: rustbase_api::security::LoginAttempts::new(),
+        lockout_policy,
+        cookie_secure: cfg.http.cookie_secure,
+        hook_fetch_allowed_hosts: cfg.hooks.fetch.allowed_hosts.clone(),
+    };
+
+    // Apply newly-added workspace/app migrations and bootstrap the reserved
+    // documentation collections for existing installations. This keeps a
+    // server upgrade safe for databases created before the docs module.
+    if let Err(e) = bootstrap_existing_docs(&state).await {
+        tracing::error!(error = %e, "documentation storage bootstrap failed");
+        return Err(e);
+    }
+
+    // Load JS hooks for every (workspace, app) that exists on disk.
+    if let Err(e) = load_all_hooks(&state).await {
+        tracing::error!(error = %e, "loading hooks at boot failed; continuing without them");
+    }
+
+    let dashboard_routes: Router<()> = Router::new()
+        .route("/_/", get(dashboard::index))
+        .route("/_/{*path}", get(dashboard::asset))
+        .route("/openapi.yaml", get(openapi_spec));
+    let mut app = build_router(state)
+        .merge(dashboard_routes)
+        // `/_/setup`, `/_/auth/admin/login`, `/_/auth/refresh` are
+        // registered as POST-only on the API. Without this fallback,
+        // a browser navigating directly to one of them gets 405
+        // instead of the SPA shell. Hand any 405 under `/_/` to the
+        // dashboard's index so the client-side router takes over.
+        .method_not_allowed_fallback(dashboard_or_405);
+
+    if let Some(handle) = metrics_handle.clone() {
+        let metrics_router: Router<()> = Router::new()
+            .route("/metrics", get(observability::metrics_endpoint))
+            .with_state(observability::MetricsState {
+                handle,
+                token: cfg.observability.metrics_token.clone(),
+            });
+        app = app.merge(metrics_router);
+    }
+
+    // Body size cap at the HTTP entry layer. Defaults to 8 MiB —
+    // override under `[http]` in `rustbase.toml` if your hooks accept
+    // larger payloads.
+    app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
+        cfg.http.max_body_bytes,
+    ));
+
+    if cfg.http.security_headers {
+        let stack = rustbase_api::middleware::security_headers::layer(
+            rustbase_api::middleware::security_headers::SecurityHeadersConfig {
+                hsts_max_age_secs: cfg.http.hsts_max_age_secs,
+                hsts_include_subdomains: cfg.http.hsts_include_subdomains,
+            },
+        );
+        app = app.layer(stack);
+    }
+
+    let cors_layer =
+        rustbase_api::middleware::cors::layer(&rustbase_api::middleware::cors::CorsConfig {
+            allow_origins: cfg.cors.allow_origins.clone(),
+            allow_credentials: cfg.cors.allow_credentials,
+            max_age: std::time::Duration::from_secs(cfg.cors.max_age_secs),
+        });
+    app = app.layer(cors_layer);
+
+    if cfg.rate_limit.enabled {
+        match rustbase_api::middleware::rate_limit::layer(
+            rustbase_api::middleware::rate_limit::RateLimitConfig {
+                per_second: cfg.rate_limit.per_second,
+                burst: cfg.rate_limit.burst,
+                trust_proxy_headers: cfg.rate_limit.trust_proxy_headers,
+            },
+        ) {
+            Some(layer) => {
+                use rustbase_api::middleware::rate_limit::RateLimitLayers;
+                app = match layer {
+                    RateLimitLayers::PeerIp(l) => app.layer(l),
+                    RateLimitLayers::ForwardedIp(l) => app.layer(l),
+                };
+                tracing::info!(
+                    per_second = cfg.rate_limit.per_second,
+                    burst = cfg.rate_limit.burst,
+                    keyed_on = if cfg.rate_limit.trust_proxy_headers {
+                        "forwarded-ip"
+                    } else {
+                        "peer-ip"
+                    },
+                    "rate-limit: enabled"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "rate-limit: bad config; layer NOT installed (per_second/burst rejected)"
+                );
+            }
+        }
+    } else {
+        tracing::warn!("rate-limit: disabled in config");
+    }
+
+    // Metrics middleware sits at the outermost layer so it observes
+    // every request — including 429s from the rate limiter and 4xx
+    // bodies rejected by `RequestBodyLimitLayer`. Only installed when
+    // the global recorder is up; otherwise the macros would silently
+    // no-op anyway.
+    if metrics_handle.is_some() {
+        app = app.layer(axum::middleware::from_fn(observability::track_http_metrics));
+    }
+
+    let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    tracing::info!(listen = %cfg.listen, "rustbase: ready");
+    // `into_make_service_with_connect_info` exposes the peer
+    // `SocketAddr` to inner services. tower-governor's
+    // `PeerIpKeyExtractor` requires it — using the default
+    // `into_make_service` would return a hard error on every request.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// `GET /openapi.yaml` — embedded OpenAPI 3.1 spec. Authored by hand
+/// under `docs/reference/openapi.yaml`, covering the SDK-facing slice
+/// of the API (auth, records, files). Public on the listener; no
+/// secrets in the document.
+async fn openapi_spec() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [("Content-Type", "application/yaml; charset=utf-8")],
+        include_str!("../../../docs/reference/openapi.yaml"),
+    )
+        .into_response()
+}
+
+/// Per-request 405 fallback. GET requests under `/_/` get the dashboard
+/// SPA shell; every other 405 stays a 405 so the API surface remains
+/// honest about which methods it accepts.
+async fn dashboard_or_405(req: axum::extract::Request) -> axum::response::Response {
+    use axum::http::{Method, StatusCode};
+    use axum::response::IntoResponse;
+    if req.method() == Method::GET && req.uri().path().starts_with("/_/") {
+        return dashboard::index().await;
+    }
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+/// Bring existing workspace/app databases up to the current migration set
+/// and ensure the reserved docs collections exist. The operation is
+/// idempotent and intentionally runs before hooks so every app has a stable
+/// collection surface before extension code is loaded.
+async fn bootstrap_existing_docs(state: &rustbase_api::AppState) -> Result<()> {
+    use rustbase_core::{AppId, WorkspaceId};
+    use rustbase_db::{apps::list_apps as db_list_apps, paths, workspaces::list_realms};
+
+    let workspaces = list_realms(state.system.pool()).await?;
+    for workspace in workspaces {
+        let workspace_id = WorkspaceId::from(workspace.id.clone());
+        let workspace_db = paths::workspace_db(state.data_dir.as_ref(), &workspace_id);
+        if !workspace_db.exists() {
+            // The master workspace row is created before its database. It is
+            // initialized lazily when the first workspace-scoped operation
+            // needs it.
+            continue;
+        }
+
+        let workspace_pool =
+            rustbase_api::docs::ensure_workspace_docs(state, &workspace_id).await?;
+
+        for app in db_list_apps(&workspace_pool).await? {
+            let app_id = AppId::from(app.id.clone());
+            let app_db = paths::app_db(state.data_dir.as_ref(), &workspace_id, &app_id);
+            if !app_db.exists() {
+                continue;
+            }
+            let app_pool =
+                rustbase_api::docs::ensure_app_docs(state, &workspace_id, &app_id).await?;
+            bootstrap_site_version_metadata(
+                &workspace_pool,
+                &app_pool,
+                &workspace.id,
+                &workspace.name,
+                &app.id,
+                &app.name,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk every workspace + app that exists in `system.db`, and load JS
+/// hooks from `data/hooks/<workspace>/<app>/` if that directory exists.
+/// Apps without a hooks directory are simply skipped.
+async fn load_all_hooks(state: &rustbase_api::AppState) -> Result<()> {
+    use rustbase_core::{AppId, WorkspaceId};
+    use rustbase_db::{apps::list_apps as db_list_apps, paths, workspaces::list_realms};
+
+    let workspaces = list_realms(state.system.pool()).await?;
+    for workspace in workspaces {
+        let workspace_id = WorkspaceId::from(workspace.id.clone());
+        // A workspace row exists in system.db before its workspace.db has been
+        // initialized (master is created at boot, before any app).
+        // Skip rather than try to read a not-yet-migrated DB.
+        if !paths::workspace_db(state.data_dir.as_ref(), &workspace_id).exists() {
+            continue;
+        }
+        let workspace_pool = state.workspaces.pool_for(&workspace_id).await?;
+        let apps_in_realm = db_list_apps(&workspace_pool).await?;
+        for app in apps_in_realm {
+            let app_id = AppId::from(app.id.clone());
+            let dir = state
+                .data_dir
+                .join("hooks")
+                .join(workspace_id.as_str())
+                .join(app_id.as_str());
+            let bridge = rustbase_api::hook_bridge::ApiBridge::new(
+                workspace_id.clone(),
+                app_id.clone(),
+                state.apps.clone(),
+            )
+            .into_sync();
+            let quoted = Arc::new(rustbase_api::mailer::QuotedMailer::new(
+                state.mailer.clone(),
+                workspace_id.clone(),
+                app_id.clone(),
+                state.apps.clone(),
+            )) as Arc<dyn rustbase_core::Mailer>;
+            let audit = rustbase_api::hook_bridge::ApiAuditBridge::new(
+                workspace_id.clone(),
+                app_id.clone(),
+                state.apps.clone(),
+            );
+            // Fetch allowlist is empty by default — set the
+            // `hook.fetch_allowed_hosts` policy (or future TOML
+            // section) to enable `$app.fetch`.
+            let fetcher = rustbase_api::hook_bridge::ApiFetchBridge::new(
+                state.hook_fetch_allowed_hosts.clone(),
+            );
+            match state
+                .hooks
+                .load_app_with(
+                    &workspace.id,
+                    &app.id,
+                    &dir,
+                    rustbase_runtime::AppHooksConfig {
+                        records: Some(bridge),
+                        mailer: Some(quoted),
+                        audit: Some(audit),
+                        fetcher: Some(fetcher),
+                        limits: rustbase_runtime::SandboxLimits::default(),
+                    },
+                )
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        workspace = %workspace.id,
+                        app = %app.id,
+                        files = n,
+                        "loaded JS hooks"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    workspace = %workspace.id,
+                    app = %app.id,
+                    error = %e,
+                    "failed to load JS hooks"
+                ),
+            }
+        }
+    }
+    Ok(())
+}

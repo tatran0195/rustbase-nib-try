@@ -1,0 +1,1405 @@
+openapi: 3.1.0
+
+info:
+  title: RustBase
+  version: 0.1.1
+  summary: Multi-tenant Backend-as-a-Service in Rust.
+  description: |
+    The SDK-facing slice of the RustBase REST API: health, end-user
+    auth (register / verify / login / refresh / logout / OTP),
+    records CRUD, files, and the typed documentation domain. Most
+    dashboard-only admin routes (`/api/workspaces/{workspace}/admins`,
+    `/_/auth/admin/login`, schema PATCH, etc.) are still omitted.
+    This file is the canonical input for the JS / TS / Dart SDKs.
+  license:
+    name: MIT OR Apache-2.0
+    url: https://github.com/pjonaszik/rustbase/blob/main/LICENSE-MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local dev server
+  - url: https://{host}
+    description: Self-hosted deployment
+    variables:
+      host:
+        default: rustbase.example.com
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Server
+    description: Health + introspection.
+  - name: Auth
+    description: End-user authentication. Tokens are bound to (workspace, user) and work against every app in the workspace.
+  - name: Records
+    description: CRUD on collection records, filter + paginate.
+  - name: Files
+    description: Multipart upload + retrieval via the storage backend.
+  - name: Documentation
+    description: Workspace site metadata, App-local documentation drafts, publishing, readers, and releases.
+  - name: Public Documentation
+    description: Anonymous or reader-authorized serving of immutable documentation snapshots.
+
+paths:
+
+  /healthz:
+    get:
+      operationId: getHealth
+      tags: [Server]
+      summary: Liveness + setup state.
+      security: []
+      responses:
+        "200":
+          description: Always 200, even when the setup wizard hasn't run.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+
+  /openapi.yaml:
+    get:
+      operationId: getOpenApiSpec
+      tags: [Server]
+      summary: This spec, served by the binary.
+      security: []
+      responses:
+        "200":
+          description: OpenAPI 3.1 YAML.
+          content:
+            application/yaml: {}
+
+  /api/workspaces/{workspace}/auth/users/register:
+    post:
+      operationId: userRegister
+      tags: [Auth]
+      summary: Self-service end-user registration.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201":
+          description: User created. The user is NOT verified — call the verification flow next.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RegisterResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "409":
+          description: A user with this email already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/workspaces/{workspace}/auth/users/login:
+    post:
+      operationId: userLogin
+      tags: [Auth]
+      summary: Exchange email + password for access + refresh tokens.
+      description: |
+        Returns one of two shapes — full tokens when the user has no
+        TOTP enrolled, or an `mfa_token` challenge if TOTP is on.
+        Clients disambiguate on the `mfa_required` discriminator.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Either tokens or an MFA challenge.
+          headers:
+            Set-Cookie:
+              description: |
+                When the request carries `X-Rb-Cookie-Auth: 1`, the
+                response also sets `rb_at` (HttpOnly) and `rb_rt`
+                (HttpOnly) cookies in addition to the JSON body.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserLoginResponse" }
+        "401":
+          description: Bad email/password.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "429":
+          description: Account is locked out after too many failed attempts. Surfaces `Retry-After` in seconds.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/workspaces/{workspace}/auth/users/login/totp:
+    post:
+      operationId: userLoginTotp
+      tags: [Auth]
+      summary: Complete a TOTP-gated login.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mfa_token, code]
+              properties:
+                mfa_token:
+                  type: string
+                  description: From the prior `userLogin` response.
+                code:
+                  type: string
+                  description: Current TOTP code from the authenticator app.
+                  pattern: "^[0-9]{6}$"
+      responses:
+        "200":
+          description: Tokens issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserTokens" }
+        "401":
+          description: Bad code or expired challenge.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/workspaces/{workspace}/auth/refresh:
+    post:
+      operationId: userRefresh
+      tags: [Auth]
+      summary: Rotate the refresh token for a new access token.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: New token pair. The old refresh token is INVALIDATED.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RefreshResponse" }
+        "401":
+          description: Refresh token unknown or already rotated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/workspaces/{workspace}/auth/logout:
+    post:
+      operationId: userLogout
+      tags: [Auth]
+      summary: Revoke the current session.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      responses:
+        "204":
+          description: |
+            The user's `(workspace, user_id)` lands in the in-memory
+            revocation set; outstanding access tokens are rejected
+            until they expire naturally. The refresh token is deleted.
+
+  /api/workspaces/{workspace}/auth/verification/request:
+    post:
+      operationId: verificationRequest
+      tags: [Auth]
+      summary: Send a verification OTP to the user's email.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "204":
+          description: Email dispatched (or queued for the LogMailer in dev).
+
+  /api/workspaces/{workspace}/auth/verification/confirm:
+    post:
+      operationId: verificationConfirm
+      tags: [Auth]
+      summary: Confirm the OTP and flip the user to verified.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: { type: string, format: email }
+                code:
+                  type: string
+                  pattern: "^[0-9]{6}$"
+      responses:
+        "204":
+          description: User is now verified.
+        "401":
+          description: Bad or expired code.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/workspaces/{workspace}/apps/{app}/collections/{coll}/records:
+    get:
+      operationId: listRecords
+      tags: [Records]
+      summary: List records in a collection.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/coll"
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: per_page
+          schema: { type: integer, minimum: 1, maximum: 200, default: 30 }
+        - in: query
+          name: filter
+          description: Filter expression — see /reference/filters.
+          schema: { type: string }
+        - in: query
+          name: sort
+          description: |
+            Comma-separated field names. Prefix with `-` for descending
+            (e.g. `sort=-updated_at,title`).
+          schema: { type: string }
+      responses:
+        "200":
+          description: Filtered + paginated page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecordListResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+    post:
+      operationId: createRecord
+      tags: [Records]
+      summary: Insert a record.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/coll"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: |
+                Field name → value. Validated against the collection
+                schema; required fields rejected if absent, unknown
+                fields rejected on strict collections.
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+
+  /api/workspaces/{workspace}/apps/{app}/collections/{coll}/records/{id}:
+    get:
+      operationId: getRecord
+      tags: [Records]
+      summary: Fetch a single record by ID.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/coll"
+        - $ref: "#/components/parameters/recordId"
+      responses:
+        "200":
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "404":
+          description: Not found OR hidden by the access rule.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+    patch:
+      operationId: updateRecord
+      tags: [Records]
+      summary: Partial update.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/coll"
+        - $ref: "#/components/parameters/recordId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Updated record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deleteRecord
+      tags: [Records]
+      summary: Hard-delete a record.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/coll"
+        - $ref: "#/components/parameters/recordId"
+      responses:
+        "204":
+          description: Deleted.
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/workspaces/{workspace}/apps/{app}/collections/{coll}/events/ws:
+    get:
+      operationId: subscribeRecordsWs
+      tags: [Records]
+      summary: Realtime WebSocket subscription on a collection.
+      description: |
+        HTTP/1.1 Upgrade to WebSocket. After upgrade the server pushes
+        one JSON frame per matching record event (`record_created`,
+        `record_updated`, `record_deleted`); the client never sends
+        application data.
+
+        Auth resolution order: `Authorization: Bearer …` header →
+        `rb_at` cookie → `?token=` query. The query fallback exists
+        because the browser `WebSocket` constructor can't set request
+        headers.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/coll"
+        - in: query
+          name: filter
+          description: Server-side filter — same grammar as `listRecords`.
+          schema: { type: string }
+        - in: query
+          name: token
+          description: Access token (RS256 JWT) when the client can't set headers.
+          schema: { type: string }
+      responses:
+        "101":
+          description: Switching Protocols — WebSocket open.
+        "401":
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/workspaces/{workspace}/apps/{app}/files:
+    get:
+      operationId: listFiles
+      tags: [Files]
+      summary: List file metadata for an App.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      responses:
+        "200":
+          description: File metadata records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FileMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: uploadFile
+      tags: [Files]
+      summary: Upload raw bytes and create file metadata.
+      description: Send the filename in `X-Filename`; `Content-Type` is stored as metadata.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - in: header
+          name: X-Filename
+          required: true
+          schema: { type: string }
+        - in: header
+          name: Content-Type
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Uploaded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileMeta" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: Upload exceeds the 25 MiB endpoint limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  /api/workspaces/{workspace}/apps/{app}/files/{id}:
+    get:
+      operationId: downloadFile
+      tags: [Files]
+      summary: Download file bytes as an attachment.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: File body. Content-Disposition is always attachment.
+          content:
+            "*/*":
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deleteFile
+      tags: [Files]
+      summary: Delete file metadata and its stored object.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: File deleted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/workspaces/{workspace}/apps/{app}/files/{id}/meta:
+    get:
+      operationId: getFileMetadata
+      tags: [Files]
+      summary: Get metadata without downloading bytes.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: File metadata.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+
+  /api/workspaces/{workspace}/apps/{app}/docs/pages:
+    get:
+      operationId: listDocumentationPages
+      tags: [Documentation]
+      summary: List draft documentation pages for an App.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: per_page
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+        - in: query
+          name: language_code
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated draft pages.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PageListResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: createDocumentationPage
+      tags: [Documentation]
+      summary: Create a page or navigation group in an App draft tree.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PageDraftInput" }
+      responses:
+        "201":
+          description: Draft page created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/pages/{id}:
+    get:
+      operationId: getDocumentationPage
+      tags: [Documentation]
+      summary: Get one draft documentation page.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/recordId"
+      responses:
+        "200":
+          description: Draft page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: updateDocumentationPage
+      tags: [Documentation]
+      summary: Update or move a draft page.
+      description: Page-tree parent, path, language, cycle, and collision invariants are enforced by the docs domain service.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/recordId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PagePatch" }
+      responses:
+        "200":
+          description: Updated draft page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+    delete:
+      operationId: deleteDocumentationPage
+      tags: [Documentation]
+      summary: Delete a draft page without leaving children orphaned.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/recordId"
+      responses:
+        "204": { description: Draft page deleted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /api/workspaces/{workspace}/docs/site:
+    get:
+      operationId: getDocumentationSite
+      tags: [Documentation]
+      summary: Get Workspace-level site metadata.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      responses:
+        "200":
+          description: Site catalog record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      operationId: updateDocumentationSite
+      tags: [Documentation]
+      summary: Create or update Workspace-level site metadata.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SiteCatalogInput" }
+      responses:
+        "200":
+          description: Updated site catalog record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/workspaces/{workspace}/docs/versions:
+    get:
+      operationId: listDocumentationVersions
+      tags: [Documentation]
+      summary: List version catalogs for a Workspace.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      responses:
+        "200":
+          description: Version catalog records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Record" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/workspaces/{workspace}/docs/versions/{app}:
+    put:
+      operationId: updateDocumentationVersion
+      tags: [Documentation]
+      summary: Create or update Workspace metadata for one App version.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VersionCatalogInput" }
+      responses:
+        "200":
+          description: Updated version catalog record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/manifest:
+    get:
+      operationId: getDocumentationManifest
+      tags: [Documentation]
+      summary: Get the App-local effective serving manifest.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      responses:
+        "200":
+          description: Effective manifest copied into the App boundary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionManifest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      operationId: updateDocumentationManifest
+      tags: [Documentation]
+      summary: Update the App-local effective serving manifest.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VersionManifest" }
+      responses:
+        "200":
+          description: Stored effective manifest.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionManifest" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/languages:
+    get:
+      operationId: listDocumentationLanguages
+      tags: [Documentation]
+      summary: List App-local language configuration.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      responses:
+        "200":
+          description: Language records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Record" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: upsertDocumentationLanguage
+      tags: [Documentation]
+      summary: Add or update an App-local language.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LanguageInput" }
+      responses:
+        "200":
+          description: Stored language record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/publish:
+    post:
+      operationId: publishDocumentationVersion
+      tags: [Documentation]
+      summary: Build and activate an immutable App-local snapshot.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PublishRequest" }
+      responses:
+        "201":
+          description: New READY deployment created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublishResponse" }
+        "202":
+          description: An equivalent publish request is already in progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublishResponse" }
+        "200":
+          description: Existing idempotent publish result reused.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublishResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/deployments:
+    get:
+      operationId: listDocumentationDeployments
+      tags: [Documentation]
+      summary: List immutable App deployments.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      responses:
+        "200":
+          description: Deployment records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Record" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/deployments/{deployment}/rollback:
+    post:
+      operationId: rollbackDocumentationDeployment
+      tags: [Documentation]
+      summary: Activate a historical immutable deployment as a new deployment.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - in: path
+          name: deployment
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: New READY rollback deployment.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/readers/grants:
+    post:
+      operationId: createDocumentationReaderGrant
+      tags: [Documentation]
+      summary: Grant or deny a reader access to an App snapshot path prefix.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReaderGrantRequest" }
+      responses:
+        "201":
+          description: Reader grant record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /api/workspaces/{workspace}/apps/{app}/docs/readers/sessions:
+    post:
+      operationId: createDocumentationReaderSession
+      tags: [Documentation]
+      summary: Issue a reader session token for a subject.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReaderSessionRequest" }
+      responses:
+        "201":
+          description: Reader token and stored session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReaderSessionResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/workspaces/{workspace}/docs/releases:
+    get:
+      operationId: getActiveDocumentationRelease
+      tags: [Documentation]
+      summary: Get the active Workspace release manifest.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      responses:
+        "200":
+          description: Active release record, or null when no release is active.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Record"
+                  - type: "null"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: createDocumentationRelease
+      tags: [Documentation]
+      summary: Compose a Workspace release from immutable READY App deployments.
+      description: The request references deployment IDs; content is not copied across App databases.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SiteReleaseRequest" }
+      responses:
+        "201":
+          description: READY site release activated atomically in the Workspace database.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ConflictError" }
+
+  /docs/{workspace}:
+    get:
+      operationId: serveDocumentationSite
+      tags: [Public Documentation]
+      summary: Serve the active Workspace release or default App snapshot.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/language"
+        - $ref: "#/components/parameters/readerAuthorization"
+      responses:
+        "200":
+          description: Immutable snapshot page response.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicPageResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /docs/{workspace}/{app}:
+    get:
+      operationId: serveDocumentationVersionRoot
+      tags: [Public Documentation]
+      summary: Serve the root page from one App's active READY deployment.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - $ref: "#/components/parameters/language"
+        - $ref: "#/components/parameters/readerAuthorization"
+      responses:
+        "200":
+          description: Immutable snapshot page response.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicPageResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /docs/{workspace}/{app}/{path}:
+    get:
+      operationId: serveDocumentationVersionPath
+      tags: [Public Documentation]
+      summary: Serve one App snapshot page, sitemap, or robots file.
+      description: Use `path` such as `guide/getting-started`, `sitemap.xml`, or `robots.txt`.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - $ref: "#/components/parameters/app"
+        - in: path
+          name: path
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/language"
+        - $ref: "#/components/parameters/readerAuthorization"
+      responses:
+        "200":
+          description: Snapshot page, sitemap, or robots response.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicPageResponse" }
+            application/xml: { schema: { type: string } }
+            text/plain: { schema: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        RS256 JWT carrying (`workspace_id`, optional `app_id`, `user_id`
+        or `admin_id`, `role`). 15-minute TTL by default. Pair with
+        the refresh token from the same login response to extend.
+
+  parameters:
+    workspace:
+      in: path
+      name: workspace
+      required: true
+      schema: { type: string }
+      description: Workspace slug.
+    app:
+      in: path
+      name: app
+      required: true
+      schema: { type: string }
+      description: App slug.
+    coll:
+      in: path
+      name: coll
+      required: true
+      schema: { type: string }
+      description: Collection slug.
+    recordId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+      description: Record ID (ULID).
+    language:
+      in: query
+      name: language
+      required: false
+      schema: { type: string }
+      description: Requested language; regional tags fall back to their base language.
+    readerAuthorization:
+      in: header
+      name: X-Docs-Reader
+      required: false
+      schema: { type: string }
+      description: "Reader session token. `Authorization: Bearer <token>` is also accepted."
+
+  responses:
+    ValidationError:
+      description: Bad request payload — see message for the offending field.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    NotFound:
+      description: Resource not found (or hidden by an access rule).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Unauthorized:
+      description: Missing, expired, or invalid credentials/reader token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    ConflictError:
+      description: Domain invariant or state-transition conflict.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+
+  schemas:
+
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code — see /reference/errors.
+        message:
+          type: string
+
+    HealthResponse:
+      type: object
+      required: [status, initialized]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        initialized:
+          type: boolean
+          description: |
+            False until the master admin has set a password via
+            `POST /_/setup`. While false, every other route returns
+            503.
+
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password:
+          type: string
+          minLength: 8
+          format: password
+
+    RegisterResponse:
+      type: object
+      required: [id, email, verified]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        verified: { type: boolean }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+
+    UserPublic:
+      type: object
+      required: [id, email, verified]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        verified: { type: boolean }
+
+    UserTokens:
+      type: object
+      required: [access_token, refresh_token, user]
+      properties:
+        access_token:
+          type: string
+          description: RS256 JWT, 15-minute TTL.
+        refresh_token:
+          type: string
+          description: Opaque random string, 30-day TTL. Single-use — rotated on every refresh.
+        user: { $ref: "#/components/schemas/UserPublic" }
+
+    UserMfaChallenge:
+      type: object
+      required: [mfa_required, mfa_token]
+      properties:
+        mfa_required:
+          type: boolean
+          enum: [true]
+          description: Discriminator. Always `true` when present.
+        mfa_token:
+          type: string
+          description: Short-lived (~5 min) token to pair with the TOTP code on `userLoginTotp`.
+
+    UserLoginResponse:
+      oneOf:
+        - $ref: "#/components/schemas/UserTokens"
+        - $ref: "#/components/schemas/UserMfaChallenge"
+
+    RefreshRequest:
+      type: object
+      properties:
+        refresh_token:
+          type: string
+          description: |
+            Optional in the body — the dashboard reads it from the
+            `rb_rt` cookie instead. Browser clients SHOULD prefer the
+            cookie path; native clients pass it here.
+
+    RefreshResponse:
+      type: object
+      required: [access_token, refresh_token]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+
+    Record:
+      type: object
+      required: [id, collection, fields, created_at, updated_at]
+      properties:
+        id: { type: string }
+        collection: { type: string }
+        fields:
+          type: object
+          additionalProperties: true
+          description: Field name → value. Shape matches the collection schema.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    RecordListResponse:
+      type: object
+      required: [items, page, per_page, total_items, total_pages]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Record" }
+        page: { type: integer }
+        per_page: { type: integer }
+        total_items: { type: integer, format: int64 }
+        total_pages: { type: integer, format: int64 }
+
+    PageListResponse:
+      type: object
+      required: [items, page, per_page, total_items, total_pages]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Record" }
+        page: { type: integer }
+        per_page: { type: integer }
+        total_items: { type: integer, format: int64 }
+        total_pages: { type: integer, format: int64 }
+
+    PageDraftInput:
+      type: object
+      required: [language_code, kind, title, slug, path, position, hidden, content, content_format]
+      properties:
+        language_code: { type: string }
+        parent_id: { type: [string, "null"] }
+        kind: { type: string, enum: [page, group] }
+        title: { type: string }
+        slug: { type: string }
+        path: { type: string }
+        position: { type: number }
+        description: { type: [string, "null"] }
+        icon: { type: [string, "null"] }
+        hidden: { type: boolean }
+        content: { type: string }
+        content_format: { type: string, enum: [markdown, mdx] }
+        config: { type: [object, "null"], additionalProperties: true }
+        translation_key: { type: [string, "null"] }
+        source_metadata: { type: [object, "null"], additionalProperties: true }
+
+    PagePatch:
+      type: object
+      additionalProperties: false
+      properties:
+        parent_id: { type: [string, "null"] }
+        kind: { type: string, enum: [page, group] }
+        title: { type: string }
+        slug: { type: string }
+        path: { type: string }
+        position: { type: number }
+        description: { type: [string, "null"] }
+        icon: { type: [string, "null"] }
+        hidden: { type: boolean }
+        content: { type: string }
+        content_format: { type: string, enum: [markdown, mdx] }
+        config: { type: [object, "null"], additionalProperties: true }
+        translation_key: { type: [string, "null"] }
+        source_metadata: { type: [object, "null"], additionalProperties: true }
+
+    SiteCatalogInput:
+      type: object
+      required: [name, slug]
+      properties:
+        name: { type: string }
+        slug: { type: string }
+        description: { type: [string, "null"] }
+        default_app_id: { type: [string, "null"] }
+        default_language_code: { type: string, default: en }
+        access_mode: { type: string, enum: [public, private], default: public }
+        canonical_url: { type: [string, "null"], format: uri }
+        theme: { type: [object, "null"], additionalProperties: true }
+
+    VersionCatalogInput:
+      type: object
+      required: [app_id, slug, name]
+      properties:
+        app_id: { type: string }
+        slug: { type: string }
+        name: { type: string }
+        is_default: { type: boolean, default: false }
+        enabled: { type: boolean, default: true }
+        position: { type: number, default: 0 }
+        source_branch_id: { type: [string, "null"] }
+        config: { type: [object, "null"], additionalProperties: true }
+
+    VersionManifest:
+      type: object
+      required: [site_slug, site_name, version_slug, version_name, default_language_code, languages, access_mode, renderer_version, snapshot_schema_version, public_path, theme, seo, source_workspace_revision, manifest_revision]
+      properties:
+        site_slug: { type: string }
+        site_name: { type: string }
+        version_slug: { type: string }
+        version_name: { type: string }
+        default_language_code: { type: string }
+        languages:
+          type: array
+          items: { $ref: "#/components/schemas/ManifestLanguage" }
+        access_mode: { type: string, enum: [public, private] }
+        renderer_version: { type: string }
+        snapshot_schema_version: { type: integer, minimum: 1 }
+        canonical_url: { type: [string, "null"], format: uri }
+        public_path: { type: string }
+        theme: { type: object, additionalProperties: true }
+        seo: { type: object, additionalProperties: true }
+        source_workspace_revision: { type: integer, format: int64 }
+        manifest_revision: { type: integer, format: int64 }
+
+    ManifestLanguage:
+      type: object
+      required: [code, label, direction]
+      properties:
+        code: { type: string }
+        label: { type: string }
+        direction: { type: string, enum: [ltr, rtl] }
+
+    LanguageInput:
+      type: object
+      required: [code, label, direction]
+      properties:
+        code: { type: string }
+        label: { type: string }
+        direction: { type: string, enum: [ltr, rtl] }
+        is_default: { type: boolean, default: false }
+        enabled: { type: boolean, default: true }
+        position: { type: number, default: 0 }
+        config: { type: [object, "null"], additionalProperties: true }
+
+    PublishRequest:
+      type: object
+      required: [idempotency_key]
+      properties:
+        idempotency_key: { type: string, minLength: 1, maxLength: 200 }
+
+    PublishResponse:
+      type: object
+      required: [deployment, checksum, reused, in_progress]
+      properties:
+        deployment: { $ref: "#/components/schemas/Record" }
+        checksum: { type: string, pattern: "^[0-9a-f]{64}$" }
+        snapshot_key: { type: [string, "null"] }
+        reused: { type: boolean }
+        in_progress: { type: boolean }
+
+    ReaderGrantRequest:
+      type: object
+      required: [subject, path_prefix]
+      properties:
+        subject: { type: string }
+        audience: { type: [string, "null"] }
+        path_prefix: { type: string }
+        expires_at: { type: [string, "null"], format: date-time }
+
+    ReaderSessionRequest:
+      type: object
+      required: [subject]
+      properties:
+        subject: { type: string }
+        ttl_seconds: { type: integer, minimum: 60, maximum: 2592000, default: 86400 }
+
+    ReaderSessionResponse:
+      type: object
+      required: [token, session]
+      properties:
+        token: { type: string }
+        session: { $ref: "#/components/schemas/Record" }
+
+    SiteReleaseRequest:
+      type: object
+      required: [deployments, default_app_id]
+      properties:
+        deployments:
+          type: object
+          additionalProperties: { type: string }
+          description: App ID to immutable READY deployment ID.
+        default_app_id: { type: string }
+        default_language_code: { type: string, default: en }
+
+    PublicPageResponse:
+      type: object
+      required: [manifest, deployment_id, checksum, language, page, navigation]
+      properties:
+        manifest: { $ref: "#/components/schemas/VersionManifest" }
+        deployment_id: { type: string }
+        checksum: { type: string, pattern: "^[0-9a-f]{64}$" }
+        language: { type: string }
+        page:
+          oneOf:
+            - $ref: "#/components/schemas/Record"
+            - type: "null"
+        navigation:
+          type: array
+          items: { $ref: "#/components/schemas/Record" }
+
+    FileMeta:
+      type: object
+      required: [id, filename, size, created_at]
+      properties:
+        id: { type: string }
+        filename: { type: string }
+        mime: { type: [string, "null"] }
+        size:
+          type: integer
+          format: int64
+          description: Bytes.
+        created_at: { type: string, format: date-time }
